@@ -8,9 +8,12 @@ const fastify = require('fastify')({
 });
 
 fastify.register(require('@fastify/cors'), {
+  // ponytail: trailing slashes stripped. A browser's Origin header never carries one, so a
+  // dashboard value pasted as `https://site.vercel.app/` matches nothing and every call fails
+  // with a CORS error that looks like the backend is down. Normalise instead of debugging it twice.
   origin: (process.env.CORS_ORIGINS || 'http://localhost:3000')
     .split(',')
-    .map((o) => o.trim())
+    .map((o) => o.trim().replace(/\/+$/, ''))
     .filter(Boolean),
   credentials: true,
   methods: ['GET', 'PUT', 'POST', 'DELETE', 'PATCH', 'OPTIONS'],
