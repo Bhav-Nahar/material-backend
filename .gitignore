@@ -1,5 +1,8 @@
 node_modules/
-.env
-.env*.local
+# Every .env variant, not just the two that were listed. `.env.bak` matched neither, which made a
+# hand-made backup of the live secrets the one committable file in the repo. Negate the example so
+# the documented template still travels with the code.
+.env*
+!.env.example
 *.log
 .DS_Store

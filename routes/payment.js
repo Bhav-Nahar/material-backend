@@ -100,6 +100,9 @@ module.exports = async function paymentRoutes(fastify) {
       // they are what the invoice is made out to, so they travel with the order rather than dying
       // in a query string.
       invoiceEmail,
+      // The number the driver calls before delivery. The address has its own phone, but a site
+      // delivery is often confirmed with a foreman who is not the account holder.
+      contactPhone,
       gstin,
       company,
       // The campaign that earned this order. Stored with the pending record so it lands on the
@@ -177,6 +180,7 @@ module.exports = async function paymentRoutes(fastify) {
             // figure the customer paid rather than a re-quote against an address edited since.
             unloading: { amount: unloading.amount, basis: unloading.basis },
             invoiceEmail: invoiceEmail || null,
+            contactPhone: /^[6-9]\d{9}$/.test(String(contactPhone || '')) ? String(contactPhone) : null,
             gstin: cleanGstin || null,
             company: company || null,
             attribution: attribution.sanitise(utms),
@@ -337,6 +341,8 @@ module.exports = async function paymentRoutes(fastify) {
             ]
           : []),
         ...(pending.invoiceEmail ? [{ key: 'Invoice email', value: pending.invoiceEmail }] : []),
+        // The number the driver actually calls -- not always the address's or the account's.
+        ...(pending.contactPhone ? [{ key: 'Delivery contact', value: pending.contactPhone }] : []),
         // utm_source / utm_medium / utm_campaign and friends, under their own names. This is what
         // makes "which campaign paid for this revenue?" answerable from the Shopify order itself --
         // until now the only attribution anywhere was a tag written once at signup.

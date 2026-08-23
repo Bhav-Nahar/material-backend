@@ -217,6 +217,69 @@ module.exports = async function customerRoutes(fastify) {
     return { deletedId: result.deletedCustomerAddressId };
   });
 
+  // GET|PUT /api/customer/pincode — the customer's delivery pincode, on `custom.pincode`.
+  //
+  // WHY A METAFIELD AND NOT AN ADDRESS. A pincode is not an address: it is entered before anyone is
+  // willing to type a house number, it is the answer to "do you even deliver to me", and it has to
+  // survive on a device where localStorage was cleared. Writing it as a draft address would put a
+  // half-empty address in the customer's account and in the Shopify admin's address book, which is
+  // where real shipping addresses live and where an operator reasonably trusts what they read.
+  //
+  // ADMIN API, for the same reason as /coupons above: metafields are not writable through the
+  // Storefront API. The id is not user input -- Shopify resolved it from the customer's own access
+  // token -- so a customer cannot point this at someone else's record.
+  //
+  // SINGLE_LINE_TEXT_FIELD, not number_integer. Indian pincodes are six-digit strings and the first
+  // digit is never 0, but they are identifiers, not quantities: nothing adds them up, and as an
+  // integer the admin would right-align them and offer to sum a column of them.
+  fastify.get('/pincode', async (request) => {
+    const owned = await adminGraphql(
+      `query pin($id: ID!) {
+         customer(id: $id) { metafield(namespace: "custom", key: "pincode") { value } }
+       }`,
+      { id: request.customer.id },
+    ).catch(() => null);
+
+    return { pincode: owned?.customer?.metafield?.value || '' };
+  });
+
+  fastify.put('/pincode', async (request, reply) => {
+    const pincode = String(request.body?.pincode ?? '').trim();
+
+    // VALIDATED HERE and not only in the browser. This is a trust boundary: the route is reachable
+    // with any body, and a metafield is read back by the storefront and by whoever is looking at the
+    // customer in the admin. Six digits, first one non-zero -- the same test lib/delivery.js runs on
+    // the client, because two different definitions of "valid pincode" is one definition too many.
+    if (!/^[1-9]\d{5}$/.test(pincode)) {
+      return reply.code(400).send({ error: 'Enter a valid 6-digit pincode' });
+    }
+
+    const result = await adminGraphql(
+      `mutation setPin($metafields: [MetafieldsSetInput!]!) {
+         metafieldsSet(metafields: $metafields) {
+           metafields { value }
+           userErrors { field message }
+         }
+       }`,
+      {
+        metafields: [
+          {
+            ownerId: request.customer.id,
+            namespace: 'custom',
+            key: 'pincode',
+            type: 'single_line_text_field',
+            value: pincode,
+          },
+        ],
+      },
+    );
+
+    const error = result?.metafieldsSet?.userErrors?.[0]?.message;
+    if (error) return reply.code(422).send({ error });
+
+    return { pincode };
+  });
+
   // GET /api/customer/coupons — what this customer has won, and whether it is still spendable.
   //
   // ADMIN API for the codes, keyed by the id inside the customer's own access token. The metafield

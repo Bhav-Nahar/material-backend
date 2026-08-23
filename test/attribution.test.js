@@ -63,3 +63,14 @@ test('customer tags stay to the three fields worth segmenting on', () => {
   });
   assert.deepEqual(tags, ['utm-source:meta', 'utm-medium:paid-social', 'utm-campaign:launch']);
 });
+
+test('a long click id survives, while a long campaign name is still trimmed', () => {
+  // A real fbclid of this era. Truncated at 120 it stays well-formed and becomes
+  // permanently unmatchable, which is the failure this guards.
+  const fbclid = 'IwZXh0bgNhZW0BMABhZGlkAasqR3Vsc0IBHtOx' + 'a'.repeat(140);
+  const out = sanitise({ fbclid, gclid: 'g'.repeat(300), utm_campaign: 'c'.repeat(300) });
+
+  assert.equal(out.fbclid, fbclid, 'fbclid must survive intact');
+  assert.equal(out.gclid.length, 300);
+  assert.equal(out.utm_campaign.length, 120, 'campaign names are still capped at 120');
+});
