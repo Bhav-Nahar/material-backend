@@ -264,6 +264,20 @@ module.exports = async function paymentRoutes(fastify) {
       return reply.code(409).send({ error: 'Your cart changed. Please contact us with your payment id.' });
     }
 
+    // The cart is a COOKIE the browser still holds, so it can be mutated between paying and this
+    // request landing -- pay for a ₹100 cart, stuff it with ₹50,000, and without this check the
+    // draft below becomes a PAID order for goods nobody paid for. The order is only built if the
+    // cart is still worth what was priced at payment time.
+    const goodsNow = Number(cart.cost?.totalAmount?.amount ?? 0);
+    const goodsPriced = pending.orderTotal - (pending.unloading?.amount || 0);
+    if (Math.abs(goodsNow - goodsPriced) > 0.01) {
+      request.log.error(
+        { razorpayPaymentId, goodsNow, goodsPriced },
+        'cart total changed between payment and completion',
+      );
+      return reply.code(409).send({ error: 'Your cart changed. Please contact us with your payment id.' });
+    }
+
     const meta = await addressMeta.loadMany(fastify.mongo.db, request.customer.id);
     const access = meta.get(addressMeta.addressKey(pending.addressId)) || {};
 
@@ -306,6 +320,10 @@ module.exports = async function paymentRoutes(fastify) {
       asInput(byKey.get(addressMeta.addressKey(pending.billingAddressId || pending.addressId))) ||
       shipTo;
 
+    // What the coupon took off the goods, in rupees, per Shopify's own arithmetic.
+    const discountAmount =
+      Math.round((Number(cart.cost?.subtotalAmount?.amount ?? 0) - goodsNow) * 100) / 100;
+
     const draftInput = {
       purchasingEntity: { customerId: request.customer.id },
       // No price overrides: Shopify prices the variants itself, so the order total is derived
@@ -315,8 +333,19 @@ module.exports = async function paymentRoutes(fastify) {
         quantity: line.quantity,
         customAttributes: (line.attributes || []).map(({ key, value }) => ({ key, value })),
       })),
-      ...(cart.discountCodes?.[0]?.applicable
-        ? { appliedDiscount: { title: cart.discountCodes[0].code, value: 0, valueType: 'FIXED_AMOUNT' } }
+      // The draft reprices every line from the catalogue, so the coupon Shopify already honoured on
+      // the cart has to be re-applied here as the rupee difference it made -- with `value: 0` the
+      // order totalled MORE than Razorpay collected and coupon orders never reconciled. The amount
+      // is Shopify's own subtotal-minus-total on the cart this order is built from, and the total
+      // check above guarantees that cart is still the one that was paid for.
+      ...(cart.discountCodes?.[0]?.applicable && discountAmount > 0
+        ? {
+            appliedDiscount: {
+              title: cart.discountCodes[0].code,
+              value: discountAmount,
+              valueType: 'FIXED_AMOUNT',
+            },
+          }
         : {}),
       // The delivery attributes the warehouse needs, on the order itself — a picker reading the
       // slip should not have to look anywhere else to know it is four floors and no lift.
