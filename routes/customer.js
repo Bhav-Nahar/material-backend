@@ -195,8 +195,20 @@ module.exports = async function customerRoutes(fastify) {
     return { address: { ...updated, ...addressMeta.normalise(address || {}) } };
   });
 
+  /*
+   * BODY FIRST, QUERY AS A FALLBACK.
+   *
+   * Shopify's customerAddressDelete needs the FULL address gid -- the numeric key alone is not an
+   * `ID!` -- and that gid has the session's customer_access_token embedded in it. In a query string
+   * it lands in this service's access logs, any proxy in front of it, and the referrer. Every other
+   * handler here already takes the id in the body for exactly that reason (create, patch,
+   * setDefault); delete was the one that did not.
+   *
+   * The query fallback stays so an older frontend keeps working -- this can deploy before, after or
+   * alongside the frontend change without a window where deleting an address 400s.
+   */
   fastify.delete('/addresses', async (request, reply) => {
-    const addressId = request.query?.addressId;
+    const addressId = request.body?.addressId || request.query?.addressId;
     if (!addressId) return reply.code(400).send({ error: 'addressId is required' });
 
     const data = await storefrontGraphql(
