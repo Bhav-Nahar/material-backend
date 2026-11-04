@@ -321,7 +321,7 @@ const UPDATE = `mutation update($id: ID!, $article: ArticleUpdateInput!) {
             ...input,
             blogId: blog.id,
             handle: guide.handle,
-            author: { name: 'Material' },
+            author: { name: 'Texture House' },
             image: { url: IMAGES[guide.image], altText: guide.title },
           },
         });
