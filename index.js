@@ -79,8 +79,9 @@ const REQUIRED_ENV = [
   'SHOPIFY_CLIENT_ID',
   'SHOPIFY_CLIENT_SECRET',
   'SHOPIFY_STOREFRONT_TOKEN',
-  'MSG91_AUTH_KEY',
-  'MSG91_TEMPLATE_ID',
+  // MSG91_AUTH_KEY / MSG91_TEMPLATE_ID: not required while login is email OTP (routes/auth-sms.js).
+  // RESEND_API_KEY: not listed either -- without it, local dev logs the code instead of emailing it,
+  // and production refuses to send (lib/emailOtp.js).
   'OTP_PROOF_SECRET',
   'MONGODB_URI',
   'MONGODB_DB',
@@ -101,12 +102,18 @@ const start = async () => {
 
     // Loud on purpose. A fixed-OTP backdoor that nobody remembers enabling is the dangerous kind,
     // and this is the one line that will be in front of someone's eyes on every deploy.
-    const { testOtpEnabled, TEST_MOBILES } = require('./lib/msg91');
-    if (testOtpEnabled()) {
+    const emailOtp = require('./lib/emailOtp');
+    if (emailOtp.testOtpEnabled()) {
       console.warn(
-        `\n  !!  TEST OTP IS ACTIVE for ${[...TEST_MOBILES].join(', ')} — a fixed code signs these\n` +
-          `      numbers in without an SMS. Clear TEST_OTP_MOBILES before this is public.\n`,
+        `\n  !!  TEST OTP IS ACTIVE for ${[...emailOtp.TEST_EMAILS].join(', ')} — a fixed code signs\n` +
+          `      these addresses in without an email. Clear TEST_OTP_EMAILS before this is public.\n`,
       );
+    }
+    if (emailOtp.logOnly()) {
+      console.warn('  !!  RESEND_API_KEY unset — login codes are printed to this log, not emailed.\n');
+    }
+    if (process.env.NODE_ENV === 'production' && !process.env.RESEND_API_KEY) {
+      console.error('  !!  RESEND_API_KEY unset in production — nobody can log in.\n');
     }
   } catch (err) {
     fastify.log.error(err);

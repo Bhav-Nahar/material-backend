@@ -1,6 +1,11 @@
-const { formatMobile, sendOtp, verifyOtp, isTestMobile } = require('../lib/msg91');
+// Email OTP via Resend. The SMS (MSG91) version of this file is routes/auth-sms.js, parked until the
+// DLT registration is our own; lib/msg91.js now only supplies formatMobile for the signup number.
+const { formatMobile } = require('../lib/msg91');
+const { normalizeEmail, sendOtp, verifyOtp, isTestEmail } = require('../lib/emailOtp');
 const otpProof = require('../lib/otpProof');
-const smsThrottle = require('../lib/smsThrottle');
+// Keyed by email address here. It is a per-key cooldown + daily cap, so the SMS limits carry over
+// as the email limits unchanged: one send a minute, five a day per inbox.
+const otpThrottle = require('../lib/smsThrottle');
 const customers = require('../lib/customer');
 const prizes = require('../lib/prizes');
 
@@ -25,7 +30,7 @@ const THIRTY_DAYS = 30 * 24 * 60 * 60;
 const SAME_SITE = process.env.COOKIE_SAMESITE || 'lax';
 const COOKIE_SECURE = process.env.NODE_ENV === 'production' || SAME_SITE === 'none';
 
-function sendSession(reply, { customer, mobile91, token, status, prize = null }) {
+function sendSession(reply, { customer, token, status, prize = null }) {
   reply.setCookie('customerAccessToken', token.accessToken, {
     httpOnly: true,
     path: '/',
@@ -35,7 +40,7 @@ function sendSession(reply, { customer, mobile91, token, status, prize = null })
   });
   return reply.send({
     status,
-    user: customers.publicShape(customer, mobile91),
+    user: customers.publicShape(customer),
     accessToken: token.accessToken,
     expiresAt: token.expiresAt,
     ...(prize ? { prize } : {}),
@@ -44,55 +49,60 @@ function sendSession(reply, { customer, mobile91, token, status, prize = null })
 
 module.exports = async function authRoutes(fastify) {
   fastify.post('/send-otp', async (request, reply) => {
-    const mobile91 = formatMobile(request.body?.mobile);
-    if (!mobile91) return reply.code(400).send({ error: 'Enter a valid 10-digit mobile number' });
+    const email = normalizeEmail(request.body?.email);
+    if (!email) return reply.code(400).send({ error: 'Enter a valid email address' });
 
-    // Test numbers skip the throttle: they cost nothing to "send", and a 60s cooldown between QA
+    // Test addresses skip the throttle: they cost nothing to "send", and a 60s cooldown between QA
     // runs is exactly the friction the fixed code exists to remove.
-    const blocked = isTestMobile(mobile91) ? null : smsThrottle.check(mobile91);
+    const blocked = isTestEmail(email) ? null : otpThrottle.check(email);
     if (blocked) {
       return reply.code(429).header('Retry-After', blocked.retryAfter).send({
         error:
           blocked.reason === 'cooldown'
             ? `Please wait ${blocked.retryAfter}s before requesting another OTP`
-            : 'Too many OTP requests for this number today',
+            : 'Too many code requests for this email today',
         retryAfter: blocked.retryAfter,
       });
     }
 
-    const { ok, body } = await sendOtp(mobile91);
-    if (!ok) {
-      request.log.error({ msg91: body }, 'MSG91 send failed');
-      return reply.code(502).send({ error: 'Could not send the OTP. Please try again.' });
+    let result;
+    try {
+      result = await sendOtp(email, fastify.mongo.db, request.log);
+    } catch (err) {
+      result = { ok: false, body: { error: err.message } };
+    }
+    if (!result.ok) {
+      request.log.error({ resend: result.body }, 'email OTP send failed');
+      return reply.code(502).send({ error: 'Could not send the code. Please try again.' });
     }
 
-    // Only a send that MSG91 accepted counts against the limit.
-    if (!isTestMobile(mobile91)) smsThrottle.record(mobile91);
+    // Only a send that went out counts against the limit.
+    if (!isTestEmail(email)) otpThrottle.record(email);
     return reply.send({ status: 'OTP_SENT' });
   });
 
-  // Verifies the OTP and, in the same call, says whether this number already has an
+  // Verifies the OTP and, in the same call, says whether this email already has an
   // account. Lucira shipped a separate /check-customer for that decision, which let
-  // anyone probe whether a phone number was registered without proving anything.
+  // anyone probe whether an account was registered without proving anything.
   // Folding it in here means the answer is only ever given to someone holding a
   // valid OTP — and it removes a whole route.
   fastify.post('/verify-otp', async (request, reply) => {
-    const mobile91 = formatMobile(request.body?.mobile);
+    const email = normalizeEmail(request.body?.email);
     const otp = String(request.body?.otp || '').replace(/\D/g, '');
-    if (!mobile91 || !otp) return reply.code(400).send({ error: 'Mobile and OTP are required' });
+    if (!email || !otp) return reply.code(400).send({ error: 'Email and code are required' });
 
-    const { ok, body } = await verifyOtp(mobile91, otp);
-    if (!ok) return reply.code(400).send({ error: body?.message || 'Invalid or expired OTP' });
+    const { ok, body } = await verifyOtp(email, otp, fastify.mongo.db);
+    if (!ok) return reply.code(400).send({ error: body?.message || 'Invalid or expired code' });
 
-    const customer = await customers.findByPhone(mobile91);
+    const customer = await customers.findByEmail(email);
     if (!customer) {
-      return reply.send({ status: 'REGISTER_REQUIRED', otpProof: otpProof.issue(mobile91) });
+      return reply.send({ status: 'REGISTER_REQUIRED', otpProof: otpProof.issue(email) });
     }
 
     // Same reasoning as register: a Shopify failure here must not reach the browser as a raw status.
     try {
       const token = await customers.issueAccessToken(customer, fastify.mongo.db);
-      return sendSession(reply, { customer, mobile91, token, status: 'LOGIN' });
+      return sendSession(reply, { customer, token, status: 'LOGIN' });
     } catch (err) {
       request.log.error({ err: err.message, body: err.body }, 'login failed');
       return reply.code(502).send({ error: 'Could not sign you in. Please try again.' });
@@ -100,31 +110,36 @@ module.exports = async function authRoutes(fastify) {
   });
 
   fastify.post('/register', async (request, reply) => {
-    const { firstName, lastName, email, acceptsMarketing, signupPath, signupSource, utms } =
+    const { firstName, lastName, acceptsMarketing, signupPath, signupSource, utms } =
       request.body || {};
 
-    // The number comes from the signed proof, never from the body — otherwise
-    // register is an open endpoint for creating verified accounts on numbers the
+    // The email comes from the signed proof, never from the body — otherwise
+    // register is an open endpoint for creating verified accounts on inboxes the
     // caller does not control.
-    const mobile91 = otpProof.verify(request.body?.otpProof);
-    if (!mobile91) {
-      return reply.code(401).send({ error: 'Please verify your mobile number again' });
+    const email = otpProof.verify(request.body?.otpProof);
+    if (!email) {
+      return reply.code(401).send({ error: 'Please verify your email again' });
     }
 
-    if (!firstName || !email) return reply.code(400).send({ error: 'Name and email are required' });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return reply.code(400).send({ error: 'Enter a valid email address' });
-    }
+    // The mobile is NOT verified on the email path -- it is the number the delivery crew calls and
+    // the Razorpay contact, so it is required, but nothing about the login depends on it.
+    const mobile91 = formatMobile(request.body?.mobile);
+    if (!firstName) return reply.code(400).send({ error: 'Name is required' });
+    if (!mobile91) return reply.code(400).send({ error: 'Enter a valid 10-digit mobile number' });
 
     // Racing two registrations, or reusing a proof after the account exists, would
     // otherwise surface as a raw Shopify 422.
-    const existing = await customers.findByPhone(mobile91);
+    const existing = await customers.findByEmail(email);
     if (existing) {
       const token = await customers.issueAccessToken(existing, fastify.mongo.db);
-      return sendSession(reply, { customer: existing, mobile91, token, status: 'LOGIN' });
+      return sendSession(reply, { customer: existing, token, status: 'LOGIN' });
     }
-    if (await customers.findByEmail(email)) {
-      return reply.code(409).send({ error: 'That email is already registered' });
+    // Shopify keeps phone numbers unique across customers. Unverified, so say it plainly rather than
+    // letting Shopify's 422 decide the message.
+    if (await customers.findByPhone(mobile91)) {
+      return reply.code(409).send({
+        error: 'That mobile number is already on another account. Log in with that account\'s email.',
+      });
     }
 
     // Decided here, on the server, and returned so the wheel can animate to it. The
@@ -165,7 +180,6 @@ module.exports = async function authRoutes(fastify) {
     }
     return sendSession(reply, {
       customer,
-      mobile91,
       token,
       status: 'REGISTER_SUCCESS',
       prize: prize ? { id: prize.id, label: prize.label, code: prize.code } : null,
